@@ -5,9 +5,6 @@ using MedicalApp.Data;
 using MedicalApp.Ddtos;
 using MedicalApp.Models;
 using System.Security.Claims;
-using MedicalApp.Data;
-using MedicalApp.Ddtos;
-using MedicalApp.Models;
 
 namespace MedicalApp.Controllers
 {
@@ -19,7 +16,6 @@ namespace MedicalApp.Controllers
         private readonly ApplicationDbContext _context;
         private readonly ILogger<DoctorController> _logger;
 
-
         public DoctorController(ApplicationDbContext context, ILogger<DoctorController> logger)
         {
             _context = context;
@@ -28,34 +24,18 @@ namespace MedicalApp.Controllers
 
         private int GetCurrentDoctorId()
         {
-            // 1. Get User ID from claims
-            var userIdClaim = User.FindFirst("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier")
-                           ?? User.FindFirst(ClaimTypes.NameIdentifier);
+            var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier);
 
             if (userIdClaim == null || !int.TryParse(userIdClaim.Value, out int userId))
             {
-                _logger.LogWarning("User ID not found or invalid in claims");
+                _logger.LogWarning("User ID claim missing or invalid");
                 return 0;
             }
 
-            // 2. Check Doctor Role
-            var roleClaim = User.FindFirst("http://schemas.microsoft.com/ws/2008/06/identity/claims/role")
-                         ?? User.FindFirst(ClaimTypes.Role);
-
-            if (roleClaim == null || roleClaim.Value != "doctor")
-            {
-                _logger.LogWarning("User doesn't have doctor role");
-                return 0;
-            }
-
-            // 3. Get DoctorId from database
-            return _context.Doctors
-                .Where(d => d.UserId == userId)
-                .Select(d => d.DoctorId)
-                .FirstOrDefault();
+            var doctor = _context.Doctors.FirstOrDefault(d => d.UserId == userId);
+            return doctor?.DoctorId ?? 0;
         }
 
-        // GET: api/doctor/my-profile
         [HttpGet("my-profile")]
         public async Task<ActionResult<DoctorProfileDto>> GetMyProfile()
         {
@@ -65,6 +45,7 @@ namespace MedicalApp.Controllers
             var doctor = await _context.Doctors
                 .Include(d => d.User)
                 .Include(d => d.Schedules)
+                .AsNoTracking()
                 .FirstOrDefaultAsync(d => d.DoctorId == doctorId);
 
             if (doctor == null) return NotFound();
@@ -83,15 +64,10 @@ namespace MedicalApp.Controllers
             };
         }
 
-        // PUT: api/doctor/my-profile
-        [Authorize(Roles = "doctor")]
         [HttpPut("my-profile")]
-        public async Task<IActionResult> UpdateMyProfile([FromBody] DoctorProfileDto profileDto) // Changed from [FromForm]
+        public async Task<IActionResult> UpdateMyProfile([FromBody] DoctorProfileDto profileDto)
         {
-            if (!ModelState.IsValid)
-            {
-                return BadRequest(ModelState);
-            }
+            if (!ModelState.IsValid) return BadRequest(ModelState);
 
             var doctorId = GetCurrentDoctorId();
             if (doctorId == 0) return Unauthorized();
@@ -102,30 +78,31 @@ namespace MedicalApp.Controllers
 
             if (doctor == null) return NotFound();
 
-            // Update profile info (no picture handling)
+            // Update basic profile fields
             doctor.Specialty = profileDto.Specialty;
             doctor.ConsultationFee = profileDto.ConsultationFee;
             doctor.Description = profileDto.Description;
 
-            // Update schedules
+            // Remove old schedules
             _context.DoctorSchedules.RemoveRange(doctor.Schedules);
-
-            foreach (var schedule in profileDto.Schedules)
-            {
-                doctor.Schedules.Add(new DoctorSchedule
-                {
-                    DayOfWeek = schedule.DayOfWeek,
-                    StartTime = schedule.StartTime,
-                    EndTime = schedule.EndTime,
-                    IsAvailable = true
-                });
-            }
-
             await _context.SaveChangesAsync();
+
+            // Add new schedules
+            var newSchedules = profileDto.Schedules.Select(s => new DoctorSchedule
+            {
+                DoctorId = doctorId,
+                DayOfWeek = s.DayOfWeek,
+                StartTime = s.StartTime,
+                EndTime = s.EndTime,
+                IsAvailable = true
+            }).ToList();
+
+            await _context.DoctorSchedules.AddRangeAsync(newSchedules);
+            await _context.SaveChangesAsync();
+
             return Ok(new { Message = "Profile updated successfully" });
         }
 
-        // GET: api/doctor/appointments
         [HttpGet("appointments")]
         public async Task<ActionResult<List<AppointmentDto>>> GetAppointments(
             [FromQuery] string? status = null,
@@ -138,32 +115,23 @@ namespace MedicalApp.Controllers
 
             var query = _context.Appointments
                 .Where(a => a.DoctorId == doctorId)
-                .Include(a => a.Patient)
-                    .ThenInclude(p => p.User)
-                .Include(a => a.Payment)
+                .Include(a => a.Patient).ThenInclude(p => p.User)
                 .Include(a => a.Schedule)
+                .Include(a => a.Payment)
+                .AsNoTracking()
                 .AsQueryable();
 
-            // Apply filters
-            if (!string.IsNullOrEmpty(status))
-            {
+            if (!string.IsNullOrWhiteSpace(status))
                 query = query.Where(a => a.Status == status);
-            }
 
-            if (!string.IsNullOrEmpty(type))
-            {
+            if (!string.IsNullOrWhiteSpace(type))
                 query = query.Where(a => a.Type == type);
-            }
 
             if (fromDate.HasValue)
-            {
-                query = query.Where(a => a.Date >= fromDate.Value.Date);
-            }
+                query = query.Where(a => a.Date.Date >= fromDate.Value.Date);
 
             if (toDate.HasValue)
-            {
-                query = query.Where(a => a.Date <= toDate.Value.Date);
-            }
+                query = query.Where(a => a.Date.Date <= toDate.Value.Date);
 
             var appointments = await query
                 .OrderBy(a => a.Date)
@@ -177,8 +145,8 @@ namespace MedicalApp.Controllers
                     TimeSlot = $"{a.Schedule.StartTime:hh\\:mm} - {a.Schedule.EndTime:hh\\:mm}",
                     Status = a.Status,
                     Type = a.Type,
-                    PaymentStatus = a.Payment != null ? a.Payment.Status : null,
-                    PaidAmount = a.Payment != null ? a.Payment.Amount : null
+                    PaymentStatus = a.Payment.Status,
+                    PaidAmount = a.Payment.Amount
                 })
                 .ToListAsync();
 

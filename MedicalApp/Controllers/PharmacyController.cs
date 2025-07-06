@@ -23,14 +23,20 @@ namespace MedicalApp.Controllers
         [HttpGet("patients")]
         public async Task<ActionResult<List<PatientDto>>> GetAllPatients()
         {
-            // Verify pharmacy authentication
-            var pharmacyUserId = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier));
-            var pharmacyExists = await _context.Pharmacies
-                .AnyAsync(p => p.UserId == pharmacyUserId);
+            // Get pharmacy UserId from token claims
+            if (!int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out int pharmacyUserId))
+            {
+                return Unauthorized("Invalid user claim");
+            }
 
-            if (!pharmacyExists) return Unauthorized();
+            // Check if pharmacy exists for current user
+            bool pharmacyExists = await _context.Pharmacies.AnyAsync(p => p.UserId == pharmacyUserId);
+            if (!pharmacyExists)
+            {
+                return Unauthorized("Pharmacy not found for user");
+            }
 
-            // Return all patients in the system
+            // Fetch patients with their user info
             var patients = await _context.Patients
                 .Include(p => p.User)
                 .OrderBy(p => p.User.FullName)
@@ -43,19 +49,30 @@ namespace MedicalApp.Controllers
                 })
                 .ToListAsync();
 
-            return patients;
+            return Ok(patients);
         }
+
+        // GET: api/pharmacy/patients-with-orders
         [HttpGet("patients-with-orders")]
         public async Task<ActionResult<List<PharmacyPatientDto>>> GetPatientsWithOrders()
         {
-            var pharmacyUserId = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier));
+            if (!int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out int pharmacyUserId))
+            {
+                return Unauthorized("Invalid user claim");
+            }
+
             var pharmacy = await _context.Pharmacies
                 .FirstOrDefaultAsync(p => p.UserId == pharmacyUserId);
 
-            if (pharmacy == null) return Unauthorized();
+            if (pharmacy == null)
+            {
+                return Unauthorized("Pharmacy not found for user");
+            }
 
-            var patients = await _context.Prescriptions
+            var patientsWithOrders = await _context.Prescriptions
                 .Where(p => p.PharmacyId == pharmacy.PharmacyId)
+                .Include(p => p.Patient)
+                    .ThenInclude(patient => patient.User)
                 .GroupBy(p => p.PatientId)
                 .Select(g => new PharmacyPatientDto
                 {
@@ -70,7 +87,7 @@ namespace MedicalApp.Controllers
                 .OrderBy(p => p.FullName)
                 .ToListAsync();
 
-            return patients;
+            return Ok(patientsWithOrders);
         }
     }
 }
